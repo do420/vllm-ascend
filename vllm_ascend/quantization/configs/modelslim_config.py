@@ -27,6 +27,7 @@ import os
 from collections.abc import Callable
 from functools import wraps
 from typing import Any, Optional
+import weakref
 
 import regex as re
 import torch
@@ -78,9 +79,17 @@ _MXFP_C8_UNUSED_FA_SUFFIXES = (
 def _make_modelslim_moe_weight_loader(
     weight_loader: Callable[..., bool | None],
 ) -> Callable[..., bool | None]:
-    """Map ModelSlim MoE scale-bias names to the upstream scale path."""
+    """Map ModelSlim MoE scale-bias names to the upstream scale path.
 
-    @wraps(weight_loader)
+    Avoid retaining a bound loader's owning layer when vLLM snapshots parameter
+    metadata for layerwise reload. The wrapper's __wrapped__ points at the
+    underlying function, matching vLLM's unwrap-and-rebind reload contract.
+    """
+    is_bound_method = getattr(weight_loader, "__self__", None) is not None
+    original_function = weight_loader.__func__ if is_bound_method else weight_loader
+    weak_loader = weakref.WeakMethod(weight_loader) if is_bound_method else None
+
+    @wraps(original_function)
     def modelslim_moe_weight_loader(
         param: torch.nn.Parameter,
         loaded_weight: torch.Tensor,
@@ -92,7 +101,13 @@ def _make_modelslim_moe_weight_loader(
         prefix, separator, param_name = weight_name.rpartition(".")
         mapped_name = _MOE_WEIGHT_LOADER_NAME_MAP.get(param_name, param_name)
         mapped_weight_name = f"{prefix}{separator}{mapped_name}"
-        return weight_loader(
+        if weak_loader is not None:
+            loader = weak_loader()
+            if loader is None:
+                raise RuntimeError("The MoE weight loader's owning layer has been released")
+        else:
+            loader = weight_loader
+        return loader(
             param=param,
             loaded_weight=loaded_weight,
             weight_name=mapped_weight_name,
@@ -102,7 +117,6 @@ def _make_modelslim_moe_weight_loader(
         )
 
     return modelslim_moe_weight_loader
-
 
 # The config filename that ModelSlim generates after quantizing a model.
 MODELSLIM_CONFIG_FILENAME = "quant_model_description.json"

@@ -215,6 +215,67 @@ class TestAscendModelSlimConfig(TestBase):
             method = self.ascend_config.get_quant_method(attention_layer, "layers.1.attn")
             self.assertIs(method, mock_ascend_kvcache.return_value)
 
+    def test_modelslim_moe_weight_loader_does_not_retain_bound_layer(self):
+        import gc
+        import weakref
+
+        from vllm.model_executor.model_loader.reload.layerwise import LAYERWISE_INFO, record_metadata_for_reloading
+
+        class Expert(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.empty(8, dtype=torch.int8), requires_grad=False)
+                self.weight_loader = _make_modelslim_moe_weight_loader(self.load_weight)
+                self.weight.weight_loader = self.weight_loader
+
+            def load_weight(self, **kwargs):
+                return True
+
+        expert = Expert()
+        record_metadata_for_reloading(expert)
+        layer_ref = weakref.ref(expert)
+        weight_ref = weakref.ref(expert.weight)
+
+        del expert
+        gc.collect()
+
+        self.assertIsNone(layer_ref())
+        self.assertIsNone(weight_ref())
+        self.assertEqual(len(LAYERWISE_INFO), 0)
+
+    def test_modelslim_moe_weight_loader_maps_bound_loader_and_can_be_rebound(self):
+        class Expert(torch.nn.Module):
+            def load_weight(
+                self, param, loaded_weight, weight_name, shard_id, expert_id, return_success=False
+            ):
+                self.last_name = weight_name
+                return True
+
+        expert = Expert()
+        wrapper = _make_modelslim_moe_weight_loader(expert.load_weight)
+        self.assertTrue(
+            wrapper(
+                param=torch.nn.Parameter(torch.empty(1)),
+                loaded_weight=torch.empty(1),
+                weight_name="model.layers.0.mlp.experts.w2_scale_bias",
+                shard_id="w2",
+                expert_id=0,
+                return_success=True,
+            )
+        )
+        self.assertEqual(expert.last_name, "model.layers.0.mlp.experts.w2_scale")
+        rebound = wrapper.__wrapped__.__get__(expert, Expert)
+        self.assertTrue(
+            rebound(
+                param=torch.nn.Parameter(torch.empty(1)),
+                loaded_weight=torch.empty(1),
+                weight_name="model.layers.0.mlp.experts.w13_scale_bias",
+                shard_id="w1",
+                expert_id=0,
+                return_success=True,
+            )
+        )
+
     def test_modelslim_moe_weight_loader_maps_scale_bias_to_scale_path(self):
         upstream_loader = MagicMock(return_value=True)
         weight_loader = _make_modelslim_moe_weight_loader(upstream_loader)
