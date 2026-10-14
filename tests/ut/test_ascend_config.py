@@ -1234,6 +1234,7 @@ class TestSubconfigPydanticTypeValidation(TestBase):
         cudagraph_capture_sizes=None,
         cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
         prefill_context_parallel_size=1,
+        pipeline_parallel_size=1,
     ):
         speculative_config = None
         if num_speculative_tokens:
@@ -1243,6 +1244,7 @@ class TestSubconfigPydanticTypeValidation(TestBase):
                 tensor_parallel_size=1,
                 data_parallel_size=8,
                 prefill_context_parallel_size=prefill_context_parallel_size,
+                pipeline_parallel_size=pipeline_parallel_size,
             ),
             compilation_config=SimpleNamespace(
                 cudagraph_mode=cudagraph_mode,
@@ -1254,6 +1256,23 @@ class TestSubconfigPydanticTypeValidation(TestBase):
             kv_transfer_config=SimpleNamespace(is_kv_consumer=True),
             model_config=SimpleNamespace(is_moe=True),
         )
+
+    def test_finegrained_tp_rejects_pipeline_parallelism(self):
+        for field_name in (
+            "oproj_tensor_parallel_size",
+            "lmhead_tensor_parallel_size",
+            "embedding_tensor_parallel_size",
+            "mlp_tensor_parallel_size",
+        ):
+            with self.subTest(field_name=field_name):
+                config = FinegrainedTPConfig(**{field_name: 2})
+                with self.assertRaisesRegex(AssertionError, "pipeline_parallel_size > 1"):
+                    config._validate_preconditions(self._oproj_tp_vllm_config(pipeline_parallel_size=2))
+
+    def test_finegrained_tp_without_pipeline_parallelism_is_unchanged(self):
+        config = FinegrainedTPConfig(embedding_tensor_parallel_size=2)
+        config._validate_preconditions(self._oproj_tp_vllm_config())
+        self.assertEqual(config.embedding_tensor_parallel_size, 2)
 
     def test_oproj_tp_requires_graph_mode(self):
         config = FinegrainedTPConfig(oproj_tensor_parallel_size=2)
