@@ -1341,6 +1341,15 @@ class FinegrainedTPConfig:
         from vllm.config.compilation import CUDAGraphMode
 
         vc = vllm_config
+        module_tp_sizes = [
+            self.oproj_tensor_parallel_size,
+            self.lmhead_tensor_parallel_size,
+            self.embedding_tensor_parallel_size,
+            self.mlp_tensor_parallel_size,
+        ]
+        if vc.parallel_config.pipeline_parallel_size > 1 and any(size > 0 for size in module_tp_sizes):
+            raise AssertionError("finegrained tp is not supported with pipeline_parallel_size > 1.")
+
         enabled_configs = []
         if self.oproj_tensor_parallel_size > 1 or self.mlp_tensor_parallel_size > 1:
             # o_proj's _forward_o_proj reshape misaligns under tp > 1; mlp is untested there.
@@ -1403,12 +1412,6 @@ class FinegrainedTPConfig:
             enabled_configs.append(f"lmhead_tensor_parallel_size={self.lmhead_tensor_parallel_size}")
         if self.embedding_tensor_parallel_size > 0:
             enabled_configs.append(f"embedding_tensor_parallel_size={self.embedding_tensor_parallel_size}")
-        module_tp_sizes = [
-            self.oproj_tensor_parallel_size,
-            self.lmhead_tensor_parallel_size,
-            self.embedding_tensor_parallel_size,
-            self.mlp_tensor_parallel_size,
-        ]
         for module_tp_size in module_tp_sizes:
             # If it is a dense model, then expert parallel is not needed,
             # and data parallel is also not needed. If the data parallel size is set
