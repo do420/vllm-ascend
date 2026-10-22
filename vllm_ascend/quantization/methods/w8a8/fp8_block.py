@@ -151,6 +151,18 @@ class AscendFp8BlockLinearMethod(AscendLinearScheme):
     weight_switch_gather_specs = (WeightSwitchGatherSpec("weight", gather_dim=1),)
     weight_switch_output_gather_specs = (WeightSwitchGatherSpec("weight"),)
 
+    @staticmethod
+    def _is_glm_mla_bf16_ablation_layer(layer: torch.nn.Module) -> bool:
+        """Diagnostic-only BF16 fallback for GLM-5-Next MLA projections."""
+        prefix = getattr(layer, "prefix", "")
+        return ".layers." in prefix and prefix.endswith(
+            (
+                ".self_attn.fused_qkv_a_proj",
+                ".self_attn.q_b_proj",
+                ".self_attn.o_proj",
+            )
+        )
+
     def _get_weight_switch_specs(
         self,
         layer: torch.nn.Module,
@@ -161,7 +173,7 @@ class AscendFp8BlockLinearMethod(AscendLinearScheme):
         str,
     ]:
         gather_specs, repeat_specs, shard_axis = super()._get_weight_switch_specs(layer, config)
-        if self.mxfp8_method is None:
+        if self.mxfp8_method is None or self._is_glm_mla_bf16_ablation_layer(layer):
             return gather_specs, repeat_specs, shard_axis
         if shard_axis == "input":
             return (
@@ -213,6 +225,14 @@ class AscendFp8BlockLinearMethod(AscendLinearScheme):
             layer.weight = torch.nn.Parameter(maybe_trans_nz(resolved), requires_grad=False)
             return
 
+        if self._is_glm_mla_bf16_ablation_layer(layer):
+            logger.warning(
+                "FP8_MLA_BF16_ABLATION active: %s",
+                getattr(layer, "prefix", ""),
+            )
+            layer.weight = torch.nn.Parameter(maybe_trans_nz(resolved), requires_grad=False)
+            return
+
         if self.mxfp8_method is not None and not _supports_mx_regroup(resolved.shape[1], self.mxfp8_method.group_size):
             logger.warning_once(
                 "Reduction dim %d of %s is not a multiple of the MXFP8 group size %d; serving this "
@@ -243,7 +263,7 @@ class AscendFp8BlockLinearMethod(AscendLinearScheme):
         layer: torch.nn.Module,
         x: torch.Tensor,
     ) -> PreparedLinearInput | None:
-        if self.mxfp8_method is None:
+        if self.mxfp8_method is None or self._is_glm_mla_bf16_ablation_layer(layer):
             return None
         return self.mxfp8_method.prepare_input_for_overlap(layer, x)
 
@@ -254,7 +274,7 @@ class AscendFp8BlockLinearMethod(AscendLinearScheme):
         bias: torch.Tensor | None = None,
         tp_rank: int | None = 0,
     ) -> torch.Tensor:
-        if self.mxfp8_method is not None:
+        if self.mxfp8_method is not None and not self._is_glm_mla_bf16_ablation_layer(layer):
             return self.mxfp8_method.apply(layer, x, bias, tp_rank)
         return torch.ops.vllm.unquantized_gemm(x, layer.weight, bias)
 
