@@ -5,15 +5,13 @@
 vLLM plans the KV cache in ``vllm.v1.core.kv_cache_planning`` and resolves the
 planner through ``Platform.get_kv_cache_config_builder_cls`` (see
 ``NPUPlatform.get_kv_cache_config_builder_cls``). Ascend-specific grouping and
-pool accounting live here; materialization stays in the patched planning
-functions (see ``patch_kv_cache_utils.py``), which
-``DefaultKVCacheConfigBuilder.get_kv_cache_config_from_groups`` calls with the
-Core-resolved ``num_blocks``.
+pool accounting live here. The inherited
+``DefaultKVCacheConfigBuilder.get_kv_cache_config_from_groups`` converts the
+Core-resolved block count to a byte budget and calls the module-level planner
+patched by ``patch_kv_cache_utils.py``.
 
-DeepSeek V4's shared-tuple grouping and geometry are the single source of
-truth in ``vllm_ascend.models.deepseek_v4.cache_config`` (RFC #21053): this
-module and ``patch_kv_cache_utils.py`` both consume it so the two lanes
-cannot drift apart.
+The builder and the patched planner share DeepSeek V4 grouping and geometry
+from ``vllm_ascend.models.deepseek_v4.cache_config`` (RFC #21053).
 """
 
 from vllm.config import VllmConfig

@@ -191,7 +191,7 @@ def _get_kv_cache_config_deepseek_v4_main(
     layout = _get_deepseek_v4_cache_layout(kv_cache_groups)
 
     bytes_per_tuple = layout.bytes_per_tuple
-    num_blocks = available_memory // (bytes_per_tuple * layout.num_layer_tuples)
+    num_blocks = available_memory // layout.pool_bytes_per_block
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
 
     tuple_stride = bytes_per_tuple * num_blocks

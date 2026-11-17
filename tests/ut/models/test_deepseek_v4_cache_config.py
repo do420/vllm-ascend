@@ -2,27 +2,23 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 """Regression tests for the centralized DeepSeek V4 shared-tuple geometry.
 
-RFC #21053 (standardize KV cache allocation process): both
-``vllm_ascend.core.kv_cache_config_builder`` (the pluggable builder, used on
-vLLM main) and ``vllm_ascend.patch.platform.patch_kv_cache_utils`` (the
-monkey-patch lane) now read this one geometry
-(``vllm_ascend.models.deepseek_v4.cache_config``). These tests exercise that
-shared module directly, with hard-coded expected values computed by hand
-from vLLM's own ``page_size_bytes`` formula
+The Ascend builder and the patched planner share DeepSeek V4 cache geometry
+(RFC #21053). These tests exercise the layout helpers and production
+materialization entry points. Expected page sizes follow vLLM's
+``page_size_bytes`` formula
 
     page_size_bytes = num_kv_heads * (block_size // tokens_per_state)
                        * (head_size + head_size_v) * dtype_itemsize
 
-(``head_size_v`` defaults to 0 for MLA/SWA-MLA specs - MLA stores a single
-latent vector, no separate V), so a regression in the geometry - not merely
-a disagreement between the two callers of the same helper - would fail
-them.
+For MLA/SWA-MLA specs, ``head_size_v`` defaults to 0 because MLA stores one
+latent vector.
 """
 
 from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.v1.core import kv_cache_planning
 from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     MLAAttentionSpec,
@@ -30,6 +26,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_ascend.core.kv_cache_config_builder import AscendKVCacheConfigBuilder
 from vllm_ascend.models.deepseek_v4.cache_config import (
     DeepseekV4CacheLayout,
     _get_kv_cache_groups_uniform_groups,
@@ -273,18 +270,33 @@ def test_layout_is_deterministic_and_bucket_mapping_is_read_only():
         layout_a.bucketed[0][256] = ("mutated",)  # type: ignore[index]
 
 
-def test_aliased_groups_produce_identical_bucket_geometry():
-    """Two cache groups built from the same layer tuple (an intentional
-    alias, e.g. a resident copy of the main cache) must bucket identically,
-    so their materialized descriptors land on the same tuple slots."""
+@pytest.mark.parametrize("entry_point", ["builder", "patched_planner"])
+def test_aliased_groups_materialize_the_same_tuple_slot(entry_point):
+    """Both entry points preserve aliasing and the trailing MTP slot."""
+    small = _mla_spec(block_size=16, head_size=4)  # page 128
     large = _mla_spec(block_size=16, head_size=8)  # page 256
-    primary = _uniform_group({"attn.0": large})
-    alias = _uniform_group({"attn.0_alias": large})
+    mtp_layer = "model.mtp.layers.0.self_attn"
+    groups = [
+        _uniform_group({"small": small, "large": large, mtp_layer: large}),
+        _uniform_group({"large_alias": large}),
+    ]
+    vllm_config = _vllm_config_no_override()
+    vllm_config.cache_config.prefix_cache_retention_interval = None
+    vllm_config.model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type="deepseek_v4"))
 
-    layout = get_deepseek_v4_cache_layout([primary, alias])
+    if entry_point == "builder":
+        config = AscendKVCacheConfigBuilder().get_kv_cache_config_from_groups(vllm_config, groups, num_blocks=5)
+    else:
+        config = kv_cache_planning.get_kv_cache_config_from_groups(vllm_config, groups, available_memory=3840)
 
-    assert layout.bucketed == ({256: ("attn.0",)}, {256: ("attn.0_alias",)})
-    assert layout.num_layer_tuples == 1
+    assert config.num_blocks == 5
+    assert len(config.kv_cache_tensors) == 4
+    assert {tuple(t.layers): (t.size, t.offset, t.layer_stride, t.block_stride) for t in config.kv_cache_tensors} == {
+        ("small",): (3840, 0, 1920, 128),
+        ("large",): (3840, 640, 1920, 256),
+        ("large_alias",): (3840, 640, 1920, 256),
+        (mtp_layer,): (3840, 2560, 0, 256),
+    }
 
 
 # --- padded physical pages (full group_and_unify -> uniform_groups pipeline) --

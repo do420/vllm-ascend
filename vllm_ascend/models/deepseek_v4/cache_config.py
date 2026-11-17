@@ -10,17 +10,12 @@ full-MLA group, the C128 group, and every SWA sub-group place their layers
 into physical tuple slots that are shared across page-size buckets, with
 MTP/draft layers occupying trailing slots of their own.
 
-Both supported lanes build on this layout:
-- ``vllm_ascend/core/kv_cache_config_builder.py`` (the pluggable
-  ``AscendKVCacheConfigBuilder``, used on vLLM main);
-- ``vllm_ascend/patch/platform/patch_kv_cache_utils.py`` (the monkey-patch
-  lane used on the release branch).
-
-so the grouping, detection, and pool-accounting logic can never drift
-between the two lanes. KVCacheTensor descriptor materialization (the actual
-offsets/strides into the physical backing) stays in
-``patch_kv_cache_utils.py``: it is Planning-stage *output*, built once per
-process from this layout, not duplicated geometry itself.
+Ascend selects ``AscendKVCacheConfigBuilder`` on both the vLLM main pin and
+v0.33.0. The builder uses this layout for grouping and pool accounting.
+Its inherited materialization method converts the Core-resolved block count
+to a byte budget and calls the module-level planner. That planner, patched
+by ``patch_kv_cache_utils.py``, uses the same layout to build tensor
+descriptors with offsets and strides into the physical backing.
 
 This module intentionally does not touch Kimi-K3's cache planning: Kimi-K3
 uses its own mixed-group layout (``vllm_ascend.models.kimi_k3``) and never
