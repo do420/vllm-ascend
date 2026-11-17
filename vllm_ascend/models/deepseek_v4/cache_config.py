@@ -12,10 +12,8 @@ MTP/draft layers occupying trailing slots of their own.
 
 Ascend selects ``AscendKVCacheConfigBuilder`` on both the vLLM main pin and
 v0.33.0. The builder uses this layout for grouping and pool accounting.
-Its inherited materialization method converts the Core-resolved block count
-to a byte budget and calls the module-level planner. That planner, patched
-by ``patch_kv_cache_utils.py``, uses the same layout to build tensor
-descriptors with offsets and strides into the physical backing.
+The builder uses Core's resolved block count directly. The legacy byte-budget
+planner shares the same descriptor materializer for offsets and strides.
 
 This module intentionally does not touch Kimi-K3's cache planning: Kimi-K3
 uses its own mixed-group layout (``vllm_ascend.models.kimi_k3``) and never
@@ -27,11 +25,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
-from vllm.utils.math_utils import cdiv, round_up
-from vllm.v1.core.kv_cache_planning import _approximate_gcd
+from vllm.utils.math_utils import cdiv
+from vllm.v1.core.kv_cache_planning import _approximate_gcd, get_uniform_page_size
 from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
+    KVCacheTensor,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
@@ -160,8 +159,6 @@ def _get_kv_cache_groups_uniform_groups(
     num_layer_tuples_per_group: list[int] = [g_spec.get_max_layers_per_page_size() for g_spec in grouped_specs]
     # Choose `num_layer_tuples` to minimize total padding across groups.
     num_layer_tuples = _approximate_gcd(num_layer_tuples_per_group, lower_bound=num_layer_tuples_per_group[0])
-    # Round up to the nearest multiple of `num_layer_tuples` (i.e., padding)
-    num_layer_tuples_per_group = [round_up(x, num_layer_tuples) for x in num_layer_tuples_per_group]
 
     # TODO(cmq): this is not general enough
     swa_mla_specs = grouped_specs[2:]
@@ -239,7 +236,7 @@ def get_deepseek_v4_cache_layout(
     # Pre-bucket each group's layers by page_size (registration order within
     # bucket). bucketed[g_idx][page_size] = [layer_name, ...].
     mtp_layer_names: list[str] = []
-    mtp_page_size = 0
+    mtp_specs: list[KVCacheSpec] = []
     bucketed: list[Mapping[int, tuple[str, ...]]] = []
     for group in kv_cache_groups:
         assert isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
@@ -252,7 +249,7 @@ def get_deepseek_v4_cache_layout(
                 b[page_size].append(name)
             else:
                 mtp_layer_names.append(name)
-                mtp_page_size = page_size
+                mtp_specs.append(specs[name])
         bucketed.append(MappingProxyType({page_size: tuple(names) for page_size, names in b.items()}))
 
     # num_layer_tuples = longest bucket list across all groups. For the
@@ -266,9 +263,59 @@ def get_deepseek_v4_cache_layout(
         page_sizes=tuple(sorted_page_sizes),
         bucketed=tuple(bucketed),
         mtp_layer_names=tuple(mtp_layer_names),
-        mtp_page_size=mtp_page_size,
+        mtp_page_size=get_uniform_page_size(mtp_specs) if mtp_specs else 0,
         num_layer_tuples=num_layer_tuples,
     )
+
+
+def materialize_deepseek_v4_tensors(layout: DeepseekV4CacheLayout, num_blocks: int) -> list[KVCacheTensor]:
+    """Build shared-backing descriptors from a resolved layout and block count."""
+    tuple_stride = layout.bytes_per_tuple * num_blocks
+    backing_size = tuple_stride * layout.num_layer_tuples
+
+    # Within every tuple slot, page-size buckets are placed consecutively.
+    page_offsets: dict[int, int] = {}
+    page_prefix = 0
+    for page_size in layout.page_sizes:
+        page_offsets[page_size] = page_prefix * num_blocks
+        page_prefix += page_size
+
+    tensors: list[KVCacheTensor] = []
+
+    # Keep each descriptor inside one cache group. Descriptors from different
+    # groups alias corresponding tuple slots by using identical geometry.
+    for group_buckets in layout.bucketed:
+        for page_size in layout.page_sizes:
+            layer_names = group_buckets.get(page_size)
+            if not layer_names:
+                continue
+
+            tensors.append(
+                KVCacheTensor(
+                    size=backing_size,
+                    layers=list(layer_names),
+                    offset=page_offsets[page_size],
+                    layer_stride=tuple_stride,
+                    block_stride=page_size,
+                )
+            )
+
+    # MTP layers receive trailing tuple slots. Unused page buckets remain
+    # padding so num_blocks and memory accounting retain the existing contract.
+    normal_tuple_slots = layout.num_layer_tuples - len(layout.mtp_layer_names)
+    for index, layer_name in enumerate(layout.mtp_layer_names):
+        slot = normal_tuple_slots + index
+        tensors.append(
+            KVCacheTensor(
+                size=backing_size,
+                layers=[layer_name],
+                offset=slot * tuple_stride + page_offsets[layout.mtp_page_size],
+                layer_stride=0,
+                block_stride=layout.mtp_page_size,
+            )
+        )
+
+    return tensors
 
 
 def is_deepseek_v4_groups(kv_cache_groups: list[KVCacheGroupSpec]) -> bool:
